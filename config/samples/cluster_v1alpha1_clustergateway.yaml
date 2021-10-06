@@ -1,0 +1,7 @@
+apiVersion: cluster.core.egd.dev/v1alpha1
+kind: ClusterGateway
+metadata:
+  name: clustergateway-sample
+spec:
+  # Add fields here
+  foo: bar

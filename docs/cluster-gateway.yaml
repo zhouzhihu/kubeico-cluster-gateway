@@ -1,0 +1,99 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway-deployment
+  labels:
+    app: gateway
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+    spec:
+      containers:
+        - name: gateway
+          image: "10.1.10.212:8082/egrand-cloud-deploy/kubeico-cluster-gateway:latest"
+          command:
+            - ./apiserver
+            - --secure-port=9443
+            - --secret-namespace=default
+            - --feature-gates=APIPriorityAndFairness=false
+          ports:
+            - containerPort: 9443
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway-service
+spec:
+  selector:
+    app: gateway
+  ports:
+    - protocol: TCP
+      port: 9443
+      targetPort: 9443
+---
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1alpha1.cluster.core.egd.dev
+  labels:
+    api: cluster-extension-apiserver
+    apiserver: "true"
+spec:
+  version: v1alpha1
+  group: cluster.core.egd.dev
+  groupPriorityMinimum: 2000
+  service:
+    name: gateway-service
+    namespace: default
+    port: 9443
+  versionPriority: 10
+  insecureSkipTLSVerify: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: system::extension-apiserver-authentication-reader:cluster-gateway
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: extension-apiserver-authentication-reader
+subjects:
+  - kind: ServiceAccount
+    name: default
+    namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: default
+  name: cluster-gateway-secret-reader
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - "secrets"
+    verbs:
+      - get
+      - list
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cluster-gateway-secret-reader
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cluster-gateway-secret-reader
+subjects:
+  - kind: ServiceAccount
+    name: default
+    namespace: default

@@ -1,0 +1,24 @@
+# permissions for end users to edit clustergateways.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: clustergateway-editor-role
+rules:
+- apiGroups:
+  - cluster.core.egd.dev
+  resources:
+  - clustergateways
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - cluster.core.egd.dev
+  resources:
+  - clustergateways/status
+  verbs:
+  - get

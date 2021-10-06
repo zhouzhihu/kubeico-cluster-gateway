@@ -1,0 +1,16 @@
+domain: core.egd.dev
+layout:
+- go.kubebuilder.io/v3
+multigroup: true
+projectName: kubeico-cluster-gateway
+repo: github.com/zhouzhihu/kubeico-cluster-gateway
+resources:
+- api:
+    crdVersion: v1
+    namespaced: true
+  domain: core.egd.dev
+  group: cluster
+  kind: ClusterGateway
+  path: github.com/zhouzhihu/kubeico-cluster-gateway/apis/cluster/v1alpha1
+  version: v1alpha1
+version: "3"

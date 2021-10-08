@@ -2,10 +2,11 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: gateway-deployment
+  namespace: ico-system
   labels:
     app: gateway
 spec:
-  replicas: 3
+  replicas: 1
   selector:
     matchLabels:
       app: gateway
@@ -16,19 +17,34 @@ spec:
     spec:
       containers:
         - name: gateway
-          image: "10.1.10.212:8082/egrand-cloud-deploy/kubeico-cluster-gateway:latest"
+          image: "10.1.10.212:8082/egrand-cloud-deploy/kubeico-cluster-gateway:v1.0"
           command:
             - ./apiserver
             - --secure-port=9443
-            - --secret-namespace=default
+            - --kubeconfig=/config/kubectl-config
+            - --authorization-kubeconfig=/config/kubectl-config
+            - --authentication-kubeconfig=/config/kubectl-config
+            - --secret-namespace=ico-system
             - --feature-gates=APIPriorityAndFairness=false
           ports:
             - containerPort: 9443
+          volumeMounts:
+            - mountPath: /config/
+              mountPropagation: HostToContainer
+              name: kubectl-config
+      volumes:
+        - configMap:
+            items:
+              - key: kubectl-config
+                path: kubectl-config
+            name: kubeico-gateway-config
+          name: kubectl-config
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: gateway-service
+  namespace: ico-system
 spec:
   selector:
     app: gateway
@@ -50,7 +66,7 @@ spec:
   groupPriorityMinimum: 2000
   service:
     name: gateway-service
-    namespace: default
+    namespace: ico-system
     port: 9443
   versionPriority: 10
   insecureSkipTLSVerify: true
@@ -67,18 +83,19 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: default
-    namespace: default
+    namespace: ico-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  namespace: default
+  namespace: ico-system
   name: cluster-gateway-secret-reader
 rules:
   - apiGroups:
       - ""
     resources:
       - "secrets"
+      - "namespaces"
     verbs:
       - get
       - list
@@ -88,7 +105,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: cluster-gateway-secret-reader
-  namespace: default
+  namespace: ico-system
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -96,4 +113,4 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: default
-    namespace: default
+    namespace: ico-system

@@ -13,6 +13,7 @@ RUN GOPROXY="https://goproxy.cn/,direct" go mod download
 COPY cmd/ cmd/
 COPY pkg/ pkg/
 COPY apis/ apis/
+COPY hack/ hack/
 
 # Build
 RUN GOPROXY="https://goproxy.cn/,direct" \
@@ -25,11 +26,21 @@ RUN GOPROXY="https://goproxy.cn/,direct" \
         -tags secret \
         cmd/non-etcd-apiserver/main.go
 
+RUN GOPROXY="https://goproxy.cn/,direct" \
+    CGO_ENABLED=0 \
+    GOOS=linux \
+    GOARCH=amd64 \
+    GO111MODULE=on \
+    go build \
+        -a -o patch \
+        hack/patch/main.go
+
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
 FROM alpine:3.13
 
 WORKDIR /
-COPY --from=builder /workspace/apiserver .
+COPY --from=builder /workspace/apiserver /
+COPY --from=builder /workspace/patch /
 
 ENTRYPOINT ["/apiserver"]

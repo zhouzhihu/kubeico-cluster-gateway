@@ -1,6 +1,4 @@
 /*
-Copyright 2021.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -18,6 +16,8 @@ package v1alpha1
 
 import (
 	"context"
+
+	"github.com/zhouzhihu/kubeico-cluster-gateway/pkg/config"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -35,8 +35,6 @@ import (
 // ManagedCluster. The Tier-II cluster model should be highly protected under
 // RBAC policies and only the admin shall have the access to view the content
 // of cluster credentials.
-//
-// Documentation: https://yuque.antfin.com/antcloud-paas/ar858o/tku0n9#6433b698
 // +k8s:openapi-gen=true
 type ClusterGateway struct {
 	metav1.TypeMeta   `json:",inline"`
@@ -51,7 +49,8 @@ type ClusterGateway struct {
 type ClusterGatewayList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []ClusterGateway `json:"items"`
+
+	Items []ClusterGateway `json:"items"`
 }
 
 // ClusterGatewaySpec defines the desired state of ClusterGateway
@@ -63,13 +62,8 @@ type ClusterGatewaySpec struct {
 type ClusterAccess struct {
 	// Endpoint is a qualified URL string for accessing the cluster.
 	// e.g. https://example.com:6443/
-	Endpoint string `json:"endpoint"`
-	// CABundle is used for verifying cluster's serving CA certificate.
-	CABundle []byte `json:"caBundle,omitempty"`
-	// Insecure indicates the cluster should be access'd w/o verifying
-	// CA certificate at client-side.
-	Insecure *bool `json:"insecure,omitempty"`
-	// ClusterAccessCredential holds authentication configuration for
+	Endpoint *ClusterEndpoint `json:"endpoint"`
+	// Credential holds authentication configuration for
 	// accessing the target cluster.
 	Credential *ClusterAccessCredential `json:"credential,omitempty"`
 }
@@ -77,8 +71,6 @@ type ClusterAccess struct {
 type CredentialType string
 
 const (
-	// LabelKeyClusterCredentialType describes the credential type in object label field
-	LabelKeyClusterCredentialType = "cluster.core.egd.dev/cluster-credential-type"
 	// CredentialTypeServiceAccountToken means the cluster is accessible via
 	// ServiceAccountToken.
 	CredentialTypeServiceAccountToken CredentialType = "ServiceAccountToken"
@@ -86,6 +78,35 @@ const (
 	// X509 certificate and key.
 	CredentialTypeX509Certificate CredentialType = "X509Certificate"
 )
+
+type ClusterEndpointType string
+
+type ClusterEndpoint struct {
+	// Type is the union discriminator for prescribing apiserver endpoint.
+	Type ClusterEndpointType `json:"type"`
+	// Const prescribes fixed endpoint for requesting target clusters.
+	Const *ClusterEndpointConst `json:"const,omitempty"`
+}
+
+const (
+	// ClusterEndpointTypeConst prescribes requesting kube-apiserver via
+	// a fixed endpoint url.
+	ClusterEndpointTypeConst ClusterEndpointType = "Const"
+	// ClusterEndpointTypeClusterProxy prescribes requesting kube-apiserver
+	// through the konnectivity tunnel. Note that no explicit endpoint are
+	// required under ClusterProxy mode.
+	ClusterEndpointTypeClusterProxy ClusterEndpointType = "ClusterProxy"
+)
+
+type ClusterEndpointConst struct {
+	// Address is a qualified hostname for accessing the local kube-apiserver.
+	Address string `json:"address"`
+	// CABundle is used for verifying cluster's serving CA certificate.
+	CABundle []byte `json:"caBundle,omitempty"`
+	// Insecure indicates the cluster should be access'd w/o verifying
+	// CA certificate at client-side.
+	Insecure *bool `json:"insecure,omitempty"`
+}
 
 type ClusterAccessCredential struct {
 	// Type is the union discriminator for credential contents.
@@ -98,7 +119,6 @@ type X509 struct {
 	Certificate []byte `json:"certificate"`
 	PrivateKey  []byte `json:"privateKey"`
 }
-
 
 var _ resource.Object = &ClusterGateway{}
 var _ resourcestrategy.Validater = &ClusterGateway{}
@@ -121,9 +141,9 @@ func (in *ClusterGateway) NewList() runtime.Object {
 
 func (in *ClusterGateway) GetGroupVersionResource() schema.GroupVersionResource {
 	return schema.GroupVersionResource{
-		Group:    "cluster.core.egd.dev",
-		Version:  "v1alpha1",
-		Resource: "clustergateways",
+		Group:    config.MetaApiGroupName,
+		Version:  config.MetaApiVersionName,
+		Resource: config.MetaApiResourceName,
 	}
 }
 
@@ -141,9 +161,23 @@ func (in *ClusterGatewayList) GetListMeta() *metav1.ListMeta {
 	return &in.ListMeta
 }
 
+type HealthyReasonType string
+
+const (
+	HealthyReasonTypeClusterGatewayNotRegistered HealthyReasonType = "ClusterGatewayNotRegistered"
+	HealthyReasonTypeCertificateMismatch         HealthyReasonType = "CertificateMismatch"
+	HealthyReasonTypeConnectionTimeout           HealthyReasonType = "ConnectionTimeout"
+	HealthyReasonTypeUnknownPrefix               HealthyReasonType = "Unknown:"
+)
+
 // ClusterGatewayStatus defines the observed state of ClusterGateway
 type ClusterGatewayStatus struct {
-	Healthy bool `json:"healthy,omitempty"`
+	// Healthy indicates whether the cluster is healthy.
+	// If the `HealthinessCheck` feature gate is enabled, calling proxy
+	// subresource upon unhealthy clusters will be rejected.
+	Healthy bool `json:"healthy"`
+	// HealthyReason is the reason explaining the cluster's healthiness.
+	HealthyReason HealthyReasonType `json:"healthyReason,omitempty"`
 }
 
 var _ resource.ObjectWithArbitrarySubResource = &ClusterGateway{}
@@ -151,5 +185,6 @@ var _ resource.ObjectWithArbitrarySubResource = &ClusterGateway{}
 func (in *ClusterGateway) GetArbitrarySubResources() []resource.ArbitrarySubResource {
 	return []resource.ArbitrarySubResource{
 		&ClusterGatewayProxy{},
+		&ClusterGatewayHealth{},
 	}
 }

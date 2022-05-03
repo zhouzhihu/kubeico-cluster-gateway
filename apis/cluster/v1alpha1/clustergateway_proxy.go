@@ -17,32 +17,39 @@ package v1alpha1
 import (
 	"context"
 	"fmt"
-	"github.com/zhouzhihu/kubeico-cluster-gateway/pkg/metrics"
-	"log"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/zhouzhihu/kubeico-cluster-gateway/pkg/config"
+	"github.com/zhouzhihu/kubeico-cluster-gateway/pkg/metrics"
+
 	"github.com/pkg/errors"
+	v1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
+	apiproxy "k8s.io/apimachinery/pkg/util/proxy"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apiserver/pkg/apis/audit"
+	"k8s.io/apiserver/pkg/audit/event"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/endpoints/handlers/responsewriters"
 	"k8s.io/apiserver/pkg/endpoints/request"
-	"k8s.io/apiserver/pkg/registry/rest"
+	registryrest "k8s.io/apiserver/pkg/registry/rest"
 	restclient "k8s.io/client-go/rest"
+	"k8s.io/client-go/transport"
 	"sigs.k8s.io/apiserver-runtime/pkg/builder/resource"
 	"sigs.k8s.io/apiserver-runtime/pkg/builder/resource/resourcerest"
 	contextutil "sigs.k8s.io/apiserver-runtime/pkg/util/context"
+	"sigs.k8s.io/apiserver-runtime/pkg/util/loopback"
 )
 
 var _ resource.SubResource = &ClusterGatewayProxy{}
-var _ rest.Storage = &ClusterGatewayProxy{}
+var _ registryrest.Storage = &ClusterGatewayProxy{}
 var _ resourcerest.Connecter = &ClusterGatewayProxy{}
 
 var proxyMethods = []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
@@ -59,6 +66,14 @@ type ClusterGatewayProxyOptions struct {
 	// Path is the target api path of the proxy request.
 	// e.g. "/healthz", "/api/v1"
 	Path string `json:"path"`
+
+	// Impersonate indicates whether to impersonate as the original
+	// user identity from the request context after proxying to the
+	// target cluster.
+	// Note that this will requires additional RBAC settings inside
+	// the target cluster for the impersonated users (i.e. the end-
+	// user using the proxy subresource.).
+	Impersonate bool `json:"impersonate"`
 }
 
 func (c *ClusterGatewayProxy) SubResourceName() string {
@@ -69,7 +84,7 @@ func (c *ClusterGatewayProxy) New() runtime.Object {
 	return &ClusterGatewayProxyOptions{}
 }
 
-func (c *ClusterGatewayProxy) Connect(ctx context.Context, id string, options runtime.Object, r rest.Responder) (http.Handler, error) {
+func (c *ClusterGatewayProxy) Connect(ctx context.Context, id string, options runtime.Object, r registryrest.Responder) (http.Handler, error) {
 	proxyOpts, ok := options.(*ClusterGatewayProxyOptions)
 	if !ok {
 		return nil, fmt.Errorf("invalid options object: %#v", options)
@@ -83,6 +98,7 @@ func (c *ClusterGatewayProxy) Connect(ctx context.Context, id string, options ru
 	if err != nil {
 		return nil, fmt.Errorf("no such cluster %v", id)
 	}
+	clusterGateway := parentObj.(*ClusterGateway)
 
 	reqInfo, _ := request.RequestInfoFrom(ctx)
 	factory := request.RequestInfoFactory{
@@ -97,10 +113,53 @@ func (c *ClusterGatewayProxy) Connect(ctx context.Context, id string, options ru
 	})
 	proxyReqInfo.Verb = reqInfo.Verb
 
+	if config.AuthorizateProxySubpath {
+		user, _ := request.UserFrom(ctx)
+		var attr authorizer.Attributes
+		if proxyReqInfo.IsResourceRequest {
+			attr, _ = event.NewAttributes(&audit.Event{
+				User: v1.UserInfo{
+					Username: user.GetName(),
+					UID:      user.GetUID(),
+					Groups:   user.GetGroups(),
+				},
+				ObjectRef: &audit.ObjectReference{
+					APIGroup:    proxyReqInfo.APIGroup,
+					APIVersion:  proxyReqInfo.APIVersion,
+					Resource:    proxyReqInfo.Resource,
+					Subresource: proxyReqInfo.Subresource,
+					Namespace:   proxyReqInfo.Namespace,
+					Name:        proxyReqInfo.Name,
+				},
+				Verb: proxyReqInfo.Verb,
+			})
+		} else {
+			attr, _ = event.NewAttributes(&audit.Event{
+				User: v1.UserInfo{
+					Username: user.GetName(),
+					UID:      user.GetUID(),
+					Groups:   user.GetGroups(),
+				},
+				ObjectRef:  nil,
+				RequestURI: proxyReqInfo.Path,
+				Verb:       proxyReqInfo.Verb,
+			})
+		}
+
+		decision, reason, err := loopback.GetAuthorizer().Authorize(ctx, attr)
+		if err != nil {
+			return nil, errors.Wrapf(err, "authorization failed due to %s", reason)
+		}
+		if decision != authorizer.DecisionAllow {
+			return nil, fmt.Errorf("proxying by user %v is forbidden authorization failed", user.GetName())
+		}
+	}
+
 	return &proxyHandler{
 		parentName:     id,
 		path:           proxyOpts.Path,
-		clusterGateway: parentObj.(*ClusterGateway),
+		impersonate:    proxyOpts.Impersonate,
+		clusterGateway: clusterGateway,
 		responder:      r,
 		finishFunc: func(code int) {
 			metrics.RecordProxiedRequestsByResource(proxyReqInfo.Resource, proxyReqInfo.Verb, code)
@@ -121,6 +180,7 @@ var _ resource.QueryParameterObject = &ClusterGatewayProxyOptions{}
 
 func (in *ClusterGatewayProxyOptions) ConvertFromUrlValues(values *url.Values) error {
 	in.Path = values.Get("path")
+	in.Impersonate = values.Get("impersonate") == "true"
 	return nil
 }
 
@@ -129,10 +189,16 @@ var _ http.Handler = &proxyHandler{}
 type proxyHandler struct {
 	parentName     string
 	path           string
+	impersonate    bool
 	clusterGateway *ClusterGateway
-	responder      rest.Responder
+	responder      registryrest.Responder
 	finishFunc     func(code int)
 }
+
+var (
+	apiPrefix = "/apis/" + config.MetaApiGroupName + "/" + config.MetaApiVersionName + "/clustergateways/"
+	apiSuffix = "/proxy"
+)
 
 func (p *proxyHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	cluster := p.clusterGateway
@@ -152,37 +218,68 @@ func (p *proxyHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 		return
 	}
 	host, _, _ := net.SplitHostPort(urlAddr.Host)
+	path := strings.TrimPrefix(request.URL.Path, apiPrefix+p.parentName+apiSuffix)
 	newReq.Host = host
-	newReq.Header.Add("Host", host)
+	newReq.URL.Path = path
+	newReq.URL.RawQuery = request.URL.RawQuery
+	newReq.RequestURI = newReq.URL.RequestURI()
 
-	proxy := httputil.NewSingleHostReverseProxy(&url.URL{Scheme: urlAddr.Scheme, Host: urlAddr.Host})
-	cfg, err := NewConfigFromCluster(cluster)
+	cfg, err := NewConfigFromCluster(request.Context(), cluster)
 	if err != nil {
 		responsewriters.InternalError(writer, request, errors.Wrapf(err, "failed creating cluster proxy client config %s", cluster.Name))
 		return
+	}
+	if p.impersonate {
+		cfg.Impersonate = getImpersonationConfig(request)
 	}
 	rt, err := restclient.TransportFor(cfg)
 	if err != nil {
 		responsewriters.InternalError(writer, request, errors.Wrapf(err, "failed creating cluster proxy client %s", cluster.Name))
 		return
 	}
+	proxy := apiproxy.NewUpgradeAwareHandler(
+		&url.URL{
+			Scheme:   urlAddr.Scheme,
+			Path:     path,
+			Host:     urlAddr.Host,
+			RawQuery: request.URL.RawQuery,
+		},
+		rt,
+		false,
+		false,
+		nil)
 
 	const defaultFlushInterval = 200 * time.Millisecond
+	transportCfg, err := cfg.TransportConfig()
+	if err != nil {
+		responsewriters.InternalError(writer, request, errors.Wrapf(err, "failed creating transport config %s", cluster.Name))
+		return
+	}
+	tlsConfig, err := transport.TLSConfigFor(transportCfg)
+	if err != nil {
+		responsewriters.InternalError(writer, request, errors.Wrapf(err, "failed creating tls config %s", cluster.Name))
+		return
+	}
+	upgrader, err := transport.HTTPWrappersForConfig(transportCfg, apiproxy.MirrorRequest)
+	if err != nil {
+		responsewriters.InternalError(writer, request, errors.Wrapf(err, "failed creating upgrader client %s", cluster.Name))
+		return
+	}
+	upgrading := utilnet.SetOldTransportDefaults(&http.Transport{
+		TLSClientConfig: tlsConfig,
+		DialContext:     cfg.Dial,
+	})
+	proxy.UpgradeTransport = apiproxy.NewUpgradeRequestRoundTripper(
+		upgrading,
+		RoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			newReq := utilnet.CloneRequest(req)
+			return upgrader.RoundTrip(newReq)
+		}))
 	proxy.Transport = rt
 	proxy.FlushInterval = defaultFlushInterval
-	proxy.ErrorLog = log.New(noSuppressPanicError{}, "", log.LstdFlags)
-	if p.responder != nil {
-		// if an optional error interceptor/responder was provided wire it
-		// the custom responder might be used for providing a unified error reporting
-		// or supporting retry mechanisms by not sending non-fatal errors to the clients
-		proxy.ErrorHandler = func(w http.ResponseWriter, req *http.Request, err error) {
-			p.responder.Error(err)
-		}
-	}
-	proxy.ModifyResponse = func(r *http.Response) error {
-		p.finishFunc(r.StatusCode)
-		return nil
-	}
+	proxy.Responder = ErrorResponderFunc(func(w http.ResponseWriter, req *http.Request, err error) {
+		p.responder.Error(err)
+	})
 	proxy.ServeHTTP(writer, newReq)
 }
 
@@ -196,4 +293,29 @@ func (noSuppressPanicError) Write(p []byte) (n int, err error) {
 		return len(p), nil
 	}
 	return os.Stderr.Write(p)
+}
+
+// +k8s:deepcopy-gen=false
+type RoundTripperFunc func(req *http.Request) (*http.Response, error)
+
+func (fn RoundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
+
+var _ apiproxy.ErrorResponder = ErrorResponderFunc(nil)
+
+// +k8s:deepcopy-gen=false
+type ErrorResponderFunc func(w http.ResponseWriter, req *http.Request, err error)
+
+func (e ErrorResponderFunc) Error(w http.ResponseWriter, req *http.Request, err error) {
+	e(w, req, err)
+}
+
+func getImpersonationConfig(req *http.Request) restclient.ImpersonationConfig {
+	user, _ := request.UserFrom(req.Context())
+	return restclient.ImpersonationConfig{
+		UserName: user.GetName(),
+		Groups:   user.GetGroups(),
+		Extra:    user.GetExtra(),
+	}
 }

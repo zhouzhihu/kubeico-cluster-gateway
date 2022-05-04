@@ -16,7 +16,10 @@ package main
 
 import (
 	clusterv1alpha1 "github.com/zhouzhihu/kubeico-cluster-gateway/apis/cluster/v1alpha1"
+	"github.com/zhouzhihu/kubeico-cluster-gateway/pkg/config"
 	"github.com/zhouzhihu/kubeico-cluster-gateway/pkg/metrics"
+	"github.com/zhouzhihu/kubeico-cluster-gateway/pkg/options"
+	"github.com/zhouzhihu/kubeico-cluster-gateway/pkg/util/singleton"
 	"k8s.io/klog"
 	"sigs.k8s.io/apiserver-runtime/pkg/builder"
 )
@@ -26,14 +29,34 @@ func main() {
 	// registering metrics
 	metrics.Register()
 
-	err := builder.APIServer.
+	cmd, err := builder.APIServer.
 		// +kubebuilder:scaffold:resource-register
 		WithResource(&clusterv1alpha1.ClusterGateway{}).
 		WithLocalDebugExtension().
-		ExposeLoopbackClientConfig().
+		ExposeLoopbackMasterClientConfig().
 		ExposeLoopbackAuthorizer().
-		Execute()
+		WithoutEtcd().
+		WithOptionsFns(func(options *builder.ServerOptions) *builder.ServerOptions {
+			if err := config.ValidateSecret(); err != nil {
+				klog.Fatal(err)
+			}
+			if err := config.ValidateClusterProxy(); err != nil {
+				klog.Fatal(err)
+			}
+			return options
+		}).
+		WithPostStartHook("init-master-loopback-client", singleton.InitLoopbackClient).
+		Build()
 	if err != nil {
+		klog.Fatal(err)
+	}
+	config.AddSecretFlags(cmd.Flags())
+	config.AddClusterProxyFlags(cmd.Flags())
+	config.AddProxyAuthorizationFlags(cmd.Flags())
+	cmd.Flags().BoolVarP(&options.ICOIntegration, "ocm-integration", "", false,
+		"Enabling OCM integration, reading cluster CA and api endpoint from managed "+
+			"cluster.")
+	if err := cmd.Execute(); err != nil {
 		klog.Fatal(err)
 	}
 }

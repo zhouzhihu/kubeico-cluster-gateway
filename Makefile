@@ -1,8 +1,12 @@
 
 # Image URL to use all building/pushing image targets
-IMG ?= kubeico-cluster-gateway:latest
+IMG ?= controller:latest
+IMG_TAG ?= latest
 # Produce CRDs that work back to Kubernetes 1.11 (no version conversion)
 CRD_OPTIONS ?= "crd:trivialVersions=true"
+
+OS?=linux
+ARCH?=amd64
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -17,7 +21,7 @@ all: manager
 
 # Run tests
 test: generate fmt vet manifests
-	go test ./... -coverprofile cover.out
+	go test ./pkg/... ./forked/... -coverprofile cover.out
 
 # Build manager binary
 manager: generate fmt vet
@@ -47,10 +51,6 @@ deploy: manifests kustomize
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
 	$(KUSTOMIZE) build config/default | kubectl apply -f -
 
-# Generate manifests e.g. CRD, RBAC etc.
-manifests: controller-gen
-	$(CONTROLLER_GEN) $(CRD_OPTIONS) rbac:roleName=manager-role webhook paths="./..." output:crd:artifacts:config=config/crd/bases
-
 # Run go fmt against code
 fmt:
 	go fmt ./...
@@ -58,10 +58,6 @@ fmt:
 # Run go vet against code
 vet:
 	go vet ./...
-
-# Generate code
-generate: controller-gen
-	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
 
 # Build the docker image
 docker-build: test
@@ -80,7 +76,7 @@ ifeq (, $(shell which controller-gen))
 	CONTROLLER_GEN_TMP_DIR=$$(mktemp -d) ;\
 	cd $$CONTROLLER_GEN_TMP_DIR ;\
 	go mod init tmp ;\
-	go get sigs.k8s.io/controller-tools/cmd/controller-gen@v0.3.0 ;\
+	go get sigs.k8s.io/controller-tools/cmd/controller-gen@v0.4.1 ;\
 	rm -rf $$CONTROLLER_GEN_TMP_DIR ;\
 	}
 CONTROLLER_GEN=$(GOBIN)/controller-gen
@@ -110,3 +106,46 @@ client-gen:
  	-g client-gen \
  	--versions=github.com/zhouzhihu/kubeico-cluster-gateway/apis/cluster/v1alpha1 \
  	--install-generators=false
+
+
+generate: controller-gen
+	${CONTROLLER_GEN} object:headerFile="hack/boilerplate.go.txt" paths="./apis/proxy/..."
+
+manifests: controller-gen
+	${CONTROLLER_GEN} $(CRD_OPTIONS) \
+		paths="./apis/proxy/..." \
+		rbac:roleName=manager-role \
+		output:crd:artifacts:config=hack/crd/bases
+
+gateway:
+	docker build -t 10.1.10.212:8082/egrand-cloud-deploy/kubeico-cluster-gateway:${IMG_TAG} \
+		--build-arg OS=${OS} \
+		--build-arg ARCH=${ARCH} \
+		-f cmd/apiserver/Dockerfile \
+		.
+
+ocm-addon-manager:
+	docker build -t 10.1.10.212:8082/egrand-cloud-deploy/kubeico-cluster-gateway-addon-manager:${IMG_TAG} \
+		--build-arg OS=${OS} \
+		--build-arg ARCH=${ARCH} \
+		-f cmd/addon-manager/Dockerfile \
+		.
+
+image: gateway ocm-addon-manager
+
+e2e-binary:
+	mkdir -p bin
+	go test -o bin/e2e -c ./e2e/
+
+e2e-binary-ocm:
+	mkdir -p bin
+	go test -o bin/e2e.ocm -c ./e2e/ocm/
+
+e2e-bench-binary:
+	go test -c ./e2e/benchmark/
+
+test-e2e: e2e-binary
+	./bin/e2e --test-cluster=loopback
+
+test-e2e-ocm: e2e-binary-ocm
+	./bin/e2e.ocm --test-cluster=loopback
